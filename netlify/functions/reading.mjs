@@ -1,106 +1,65 @@
 import { getStore } from "@netlify/blobs";
 
 const store = getStore("alcoholimetro-data");
-const cors = {
+const headers = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "Content-Type, X-Device-Token",
+  "Access-Control-Allow-Headers": "Content-Type",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Content-Type": "application/json; charset=utf-8",
   "Cache-Control": "no-store"
 };
-
-const defaultConfig = {
-  mode: "auto",          // auto | silent | test
-  warning: 35,           // índice relativo 0..100
-  high: 65,
-  critical: 85,
-  alarmEnabled: true,
-  warmupHours: 48,
-  warmupCommand: 0
-};
-
-const json = (data, status = 200) =>
-  new Response(JSON.stringify(data), { status, headers: cors });
+const defaults = { mode: "auto", warning: 35, high: 65, critical: 85, warmupHours: 48, warmupCommand: 0 };
+const reply = (data, status = 200) => new Response(JSON.stringify(data), { status, headers });
+const clamp = (v, min, max, fallback) => Number.isFinite(Number(v)) ? Math.min(max, Math.max(min, Number(v))) : fallback;
 
 export default async (request) => {
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
-
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers });
   try {
     if (request.method === "GET") {
-      const [readingRaw, configRaw] = await Promise.all([
-        store.get("latest", { type: "json" }),
-        store.get("config", { type: "json" })
+      const [reading, saved] = await Promise.all([
+        store.get("latest", { type: "json" }), store.get("config", { type: "json" })
       ]);
-      return json({
-        reading: readingRaw || null,
-        config: { ...defaultConfig, ...(configRaw || {}) },
-        serverTime: new Date().toISOString()
-      });
+      return reply({ reading: reading || null, config: { ...defaults, ...(saved || {}) }, serverTime: new Date().toISOString() });
     }
-
-    if (request.method !== "POST") return json({ error: "Método no permitido" }, 405);
-
+    if (request.method !== "POST") return reply({ error: "Método no permitido" }, 405);
     const body = await request.json();
+    const old = { ...defaults, ...((await store.get("config", { type: "json" })) || {}) };
 
-    // El panel inicia un nuevo ciclo físico de precalentamiento.
     if (body.action === "startWarmup") {
-      const hours = clamp(body.hours, 1, 48, 48);
-      const previous = (await store.get("config", { type: "json" })) || {};
-      const cfg = { ...defaultConfig, ...previous, warmupHours: hours, warmupCommand: Date.now() };
-      await store.set("config", JSON.stringify(cfg));
-      return json({ ok: true, config: cfg });
+      const hours = Math.round(clamp(body.hours, 1, 48, 48));
+      const config = { ...old, warmupHours: hours, warmupCommand: Date.now() };
+      await store.set("config", JSON.stringify(config));
+      return reply({ ok: true, config });
     }
-
-    // Configuración enviada desde el panel. Se limita a valores conocidos.
     if (body.action === "config") {
-      const cfg = {
-        mode: ["auto", "silent", "test"].includes(body.config?.mode) ? body.config.mode : "auto",
-        warning: clamp(body.config?.warning, 5, 90, defaultConfig.warning),
-        high: clamp(body.config?.high, 10, 95, defaultConfig.high),
-        critical: clamp(body.config?.critical, 15, 100, defaultConfig.critical),
-        alarmEnabled: Boolean(body.config?.alarmEnabled),
-        warmupHours: clamp(body.config?.warmupHours, 1, 48, defaultConfig.warmupHours),
-        warmupCommand: Number(body.config?.warmupCommand || 0)
+      const incoming = body.config || {};
+      const config = {
+        ...old,
+        mode: ["auto", "silent", "test"].includes(incoming.mode) ? incoming.mode : old.mode,
+        warning: clamp(incoming.warning, 5, 90, old.warning),
+        high: clamp(incoming.high, 10, 95, old.high),
+        critical: clamp(incoming.critical, 15, 100, old.critical)
       };
-      if (!(cfg.warning < cfg.high && cfg.high < cfg.critical)) {
-        return json({ error: "Los niveles deben cumplir advertencia < alta < crítica." }, 400);
-      }
-      await store.set("config", JSON.stringify(cfg));
-      return json({ ok: true, config: cfg });
+      if (!(config.warning < config.high && config.high < config.critical)) return reply({ error: "Los niveles deben cumplir advertencia < alta < crítica." }, 400);
+      await store.set("config", JSON.stringify(config));
+      return reply({ ok: true, config });
     }
 
-    const expected = Netlify.env.get("DEVICE_TOKEN");
-    const received = request.headers.get("x-device-token");
-    if (!expected || received !== expected) return json({ error: "No autorizado" }, 401);
-
-    const value = Number(body.raw);
-    const index = Number(body.index);
-    const warming = Boolean(body.warming);
-    if (!Number.isFinite(value) || value < 0 || value > 1023 ||
-        !Number.isFinite(index) || index < 0 || index > 100) {
-      return json({ error: "Lectura inválida" }, 400);
-    }
-
+    // Endpoint de telemetría para prototipo académico: no requiere token.
+    const raw = Number(body.raw), index = Number(body.index), warming = Boolean(body.warming);
+    if (!Number.isFinite(raw) || raw < 0 || raw > 1023 || !Number.isFinite(index) || index < 0 || index > 100) return reply({ error: "Lectura inválida" }, 400);
     const reading = {
-      raw: Math.round(value),
-      index: Math.round(index * 10) / 10,
+      raw: Math.round(raw), index: Math.round(index * 10) / 10,
       mgL: !warming && body.calibrated && Number.isFinite(Number(body.mgL)) ? Number(body.mgL) : null,
-      calibrated: !warming && Boolean(body.calibrated),
-      warming,
-      warmupHours: clamp(body.warmupHours, 1, 48, 48),
-      remainingSec: clamp(body.remainingSec, 0, 48 * 3600, 0),
+      calibrated: !warming && Boolean(body.calibrated), warming,
+      warmupHours: Math.round(clamp(body.warmupHours, 1, 48, 48)),
+      remainingSec: Math.round(clamp(body.remainingSec, 0, 172800, 0)),
       status: String(warming ? "Precalentando" : (body.status || "Sin clasificar")).slice(0, 24),
-      deviceTime: String(body.deviceTime || "").slice(0, 40),
       receivedAt: new Date().toISOString()
     };
     await store.set("latest", JSON.stringify(reading));
-    return json({ ok: true, receivedAt: reading.receivedAt });
+    return reply({ ok: true, receivedAt: reading.receivedAt });
   } catch (error) {
-    return json({ error: "Error procesando la solicitud", detail: String(error?.message || error) }, 500);
+    return reply({ error: "Error procesando la solicitud", detail: String(error?.message || error) }, 500);
   }
 };
-
-function clamp(value, min, max, fallback) {
-  const n = Number(value);
-  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
-}
